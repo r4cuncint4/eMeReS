@@ -1,0 +1,151 @@
+name: Hagezi RuleSet Builder
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *"
+
+concurrency:
+  group: ruleset-build
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  HAGEZI_BASE: https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard
+
+jobs:
+  build:
+    name: Build & Publish RuleSets
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Prepare — timestamp & MiHomo
+        run: |
+          echo "BUILD_TS=$(date -u +%Y%m%d%H%M%S)" >> $GITHUB_ENV
+
+          API=https://api.github.com/repos/MetaCubeX/mihomo/releases/latest
+          URL=$(curl -sSLf \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "$API" \
+            | jq -r '[.assets[] | select(.name | test("mihomo-linux-amd64-v[^-]+\\.gz$"))][0].browser_download_url')
+
+          [[ -z "$URL" || "$URL" == "null" ]] \
+            && { echo "::error::Cannot resolve MiHomo release URL"; exit 1; }
+
+          curl -sSLf --retry 3 --retry-delay 2 "$URL" -o mihomo.gz &
+          MIHOMO_PID=$!
+
+          mkdir -p raw dist
+
+          declare -A LISTS=(
+            [ProPlus]="pro.plus-onlydomains.txt"
+            [TIF]="tif-onlydomains.txt"
+            [Gambling]="gambling-onlydomains.txt"
+            [Xiaomi]="native.xiaomi-onlydomains.txt"
+            [WhitelistReferral]="whitelist-referral-onlydomains.txt"
+          )
+
+          pids=()
+          for key in "${!LISTS[@]}"; do
+            (
+              curl -sSLf --retry 3 --retry-delay 2 \
+                "${HAGEZI_BASE}/${LISTS[$key]}" -o "raw/${key}.txt" \
+                && echo "OK  ${key}" \
+                || { echo "::error::Failed to download ${key}"; exit 1; }
+            ) &
+            pids+=($!)
+          done
+
+          failed=0
+          for pid in "${pids[@]}"; do
+            wait "$pid" || failed=$((failed + 1))
+          done
+          wait "$MIHOMO_PID" || { echo "::error::Failed to download MiHomo"; exit 1; }
+
+          [[ $failed -gt 0 ]] && exit 1
+
+          gunzip mihomo.gz
+          chmod +x mihomo
+          echo "MiHomo: $(./mihomo -v 2>&1 | head -1)"
+          echo "All ${#LISTS[@]} filter lists downloaded."
+
+      - name: Process & convert to MRS
+        run: |
+          process() {
+            local name="$1"
+            local count
+
+            count=$(awk 'NF && !/^[[:space:]]*#/ { print "+." $0 }' "raw/${name}.txt" \
+              | tee >(./mihomo convert-ruleset domain text /dev/stdin "dist/${name}.mrs") \
+              | wc -l)
+
+            [[ $count -eq 0 ]] \
+              && { echo "::error::${name} produced 0 entries"; exit 1; }
+
+            printf "%-20s %6d entries → dist/%s.mrs\n" "$name" "$count" "$name"
+          }
+
+          process ProPlus
+          process TIF
+          process Gambling
+          process Xiaomi
+          process WhitelistReferral
+
+      - name: Build summary
+        if: success()
+        run: |
+          {
+            echo "### Build Summary"
+            echo "| RuleSet | Size |"
+            echo "|---|---|"
+            for f in dist/*.mrs; do
+              name=$(basename "$f" .mrs)
+              size=$(du -h "$f" | cut -f1)
+              echo "| ${name} | ${size} |"
+            done
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.BUILD_TS }}
+          name: ${{ env.BUILD_TS }}
+          body: "Auto-generated ruleset build — `${{ env.BUILD_TS }}` UTC"
+          files: dist/*
+
+      - name: Push to release branch
+        run: |
+          cd dist
+          git init -q
+          git config user.name  "${{ github.actor }}"
+          git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+          git checkout -q -b release
+          git add .
+          git commit -q -m "build: ${{ env.BUILD_TS }}"
+          git remote add origin \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+          git push -qf origin release
+
+      - name: Purge jsDelivr cache
+        if: success()
+        run: |
+          pids=()
+          for f in dist/*; do
+            name=$(basename "$f")
+            (
+              code=$(curl -sf -o /dev/null -w "%{http_code}" \
+                "https://purge.jsdelivr.net/gh/${{ github.repository }}@release/${name}")
+              printf "Purge %-38s → HTTP %s\n" "$name" "$code"
+            ) &
+            pids+=($!)
+          done
+          for pid in "${pids[@]}"; do wait "$pid"; done
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf raw dist mihomo mihomo.gz
+        
